@@ -122,19 +122,43 @@ void profile_matrix_times_vector(int n, OpenCL& opencl) {
           {bandwidth(n*n+n+n, t0, t1), bandwidth(n*n+n+n, t2, t3)});
 }
 
-void profile_matrix_times_matrix(int n) {
+void profile_matrix_times_matrix(int n, OpenCL& opencl) {
     auto a = random_matrix<float>(n,n);
     auto b = random_matrix<float>(n,n);
     Matrix<float> result(n,n), expected_result(n,n);
+    opencl.queue.flush();
+    cl::Kernel kernel(opencl.program, "matrix_times_matrix");
+
     auto t0 = clock_type::now();
     matrix_times_matrix(a, b, expected_result);
+
     auto t1 = clock_type::now();
+    cl::Buffer d_a(opencl.queue, begin(a), end(a), true);
+    cl::Buffer d_b(opencl.queue, begin(b), end(b), true);
+    cl::Buffer d_result(opencl.context, CL_MEM_WRITE_ONLY, result.size()*sizeof(float));
+    int local_size = sqrt(opencl.device.getInfo<CL_DEVICE_MAX_WORK_GROUP_SIZE>());
+
+    while ((n*n) % (local_size*local_size) != 0) {
+       local_size--;
+    }
+
+    kernel.setArg(0, d_a);
+    kernel.setArg(1, d_b);
+    kernel.setArg(2, d_result);
+    kernel.setArg(3, n);
+    kernel.setArg(4, local_size*local_size*sizeof(float), NULL);
+    kernel.setArg(5, local_size*local_size*sizeof(float), NULL);
+    opencl.queue.finish();
+
     auto t2 = clock_type::now();
+    opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(n, n), cl::NDRange(local_size, local_size));
+    opencl.queue.finish();
+
     auto t3 = clock_type::now();
+    cl::copy(opencl.queue, d_result, begin(result), end(result));
+
     auto t4 = clock_type::now();
-    // TODO Implement OpenCL version! See profile_vector_times_vector for an example.
-    // TODO Uncomment the following line!
-    //verify_matrix(expected_result, result);
+    verify_matrix(expected_result, result);
     print("matrix-times-matrix",
           {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3},
           {bandwidth(n*n+n*n+n*n, t0, t1), bandwidth(n*n+n*n+n*n, t2, t3)});
@@ -145,7 +169,7 @@ void opencl_main(OpenCL& opencl) {
     print_column_names();
     profile_vector_times_vector(1024*1024*10, opencl);
     profile_matrix_times_vector(1024*10, opencl);
-    profile_matrix_times_matrix(1024);
+    profile_matrix_times_matrix(1024, opencl);
 }
 
 const std::string src = R"(
@@ -155,7 +179,6 @@ kernel void vector_times_vector(global float* a,
     const int i = get_global_id(0);
     result[i] = a[i] * b[i];
 }
-
 kernel void matrix_times_vector(global const float* a,
                                 global const float* b,
                                 global float* result) {
@@ -167,11 +190,33 @@ kernel void matrix_times_vector(global const float* a,
     }
     result[i] = sum;
 }
-
 kernel void matrix_times_matrix(global float* a,
                                 global float* b,
-                                global float* result) {
-    // TODO: Implement OpenCL version.
+                                global float* result,
+                                int n,
+                                local float* loc_block_A,
+                                local float* loc_block_B) {
+    int local_size = get_local_size(0);
+    int gid_0 = get_group_id(0);
+    int gid_1 = get_group_id(1);
+    int lid_0 = get_local_id(0);
+    int lid_1 = get_local_id(1);
+    int a_start = n * local_size * gid_1;
+    int a_end   = a_start + n - 1;
+    int a_step  = local_size;
+    int b_start = local_size * gid_0;
+    int b_step  = local_size * n;
+    float resultSub = 0.0f;
+    for (int i = a_start, j = b_start; i <= a_end; i += a_step, j += b_step) {
+        loc_block_A[lid_0 + lid_1*local_size] = a[i + n*lid_1 + lid_0];
+        loc_block_B[lid_0 + lid_1*local_size] = b[j + n*lid_1 + lid_0];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int k = 0; k < local_size; ++k) {
+            resultSub += loc_block_A[k + lid_1*local_size] * loc_block_B[lid_0 + k*local_size];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    result[get_global_id(1) * get_global_size(0) + get_global_id(0)] = resultSub;
 }
 )";
 
