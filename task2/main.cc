@@ -152,6 +152,10 @@ void profile_scan_inclusive(int n, OpenCL& opencl) {
     kernel_fin.setArg(1, 1024);
     opencl.queue.enqueueNDRangeKernel(kernel_fin, cl::NullRange, cl::NDRange(n/1024 - 1), cl::NullRange);
 
+    kernel_fin.setArg(0, d_a);
+    kernel_fin.setArg(1, 1024*1024);
+    opencl.queue.enqueueNDRangeKernel(kernel_fin, cl::NullRange, cl::NDRange(n/(1024 * 1024) - 1), cl::NullRange);
+
     opencl.queue.finish();
 
     auto t3 = clock_type::now();
@@ -165,16 +169,16 @@ void profile_scan_inclusive(int n, OpenCL& opencl) {
 
     //verify_vector(expected_result, result);
 
-    for (int k = 1; k < n; k *= 2) {
-      std::cout << result[k] << ' ' << expected_result[k] << ' ' << std::abs(result[k] - expected_result[k]) << '\n';
-    }
+    // for (int k = 1; k < n; k += 1) {
+    //   std::cout << k << ' ' << result[k] << ' ' << expected_result[k] << ' ' << std::abs(result[k] - expected_result[k]) << '\n';
+    // }
     std::cout << result[1024*1024*10 - 1] << ' ' << expected_result[1024*1024*10 - 1] << ' ' << std::abs(result[1024*1024*10 - 1] - expected_result[1024*1024*10 -1]) << '\n';
 }
 
 void opencl_main(OpenCL& opencl) {
     using namespace std::chrono;
     print_column_names();
-    profile_reduce(1024*1024*10, opencl);
+    // profile_reduce(1024*1024*10, opencl);
     profile_scan_inclusive(1024*1024*10, opencl);
 }
 
