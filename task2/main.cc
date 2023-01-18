@@ -118,60 +118,62 @@ void profile_reduce(int n, OpenCL& opencl) {
     std::cout << "Result: " << result << "; Expected result: " << expected_result << "; Abs error: "  << std::abs(result - expected_result) << "\n";
 }
 
-void profile_scan_inclusive(int n, OpenCL& opencl) {
+void profile_scan_inclusive(int n, OpenCL &opencl)
+{
     auto a = random_vector<float>(n);
     Vector<float> result(a), expected_result(a);
-    opencl.queue.flush();
-    cl::Kernel kernel(opencl.program, "scan_inclusive");
-    cl::Kernel kernel_fin(opencl.program, "finish_scan_inclusive");
+    int global_size = n;
+    int local_size = 64;
 
+    std::vector<cl::Buffer> tiles;
+    std::vector<int> sizes;
+    cl::Kernel kernel_scan(opencl.program, "scan_inclusive");
+    cl::Kernel kernel_complete(opencl.program, "scan_complete");
     auto t0 = clock_type::now();
     scan_inclusive(expected_result);
-
     auto t1 = clock_type::now();
-    cl::Buffer d_a(opencl.queue, begin(a), end(a), false);
-    opencl.queue.finish();
-
+    cl::Buffer d_a(opencl.queue, begin(a), end(a), true);
+    tiles.emplace_back(d_a);
     auto t2 = clock_type::now();
-    kernel.setArg(0, d_a);
-    kernel.setArg(1, d_a);
-    kernel.setArg(2, 1);
-    opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(n), cl::NDRange(1024));
+    int i = 0;
 
-    kernel.setArg(0, d_a);
-    kernel.setArg(1, d_a);
-    kernel.setArg(2, 1*1024);
-    opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(n/1024), cl::NDRange(1024));
+    while (global_size > 1){
+        int next_global_size = (global_size + local_size - 1) / local_size;
+        
+        cl::Buffer tile_result(opencl.context, CL_MEM_READ_WRITE, (global_size + local_size) * sizeof(float));
+        tiles.emplace_back(tile_result);
+        sizes.emplace_back(global_size);
 
-    kernel.setArg(0, d_a);
-    kernel.setArg(1, d_a);
-    kernel.setArg(2, 1*1024*1024);
-    opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(n/(1024*1024)), cl::NDRange(10));
+        kernel_scan.setArg(0, tiles[i]);
+        kernel_scan.setArg(1, tiles[i + 1]);
+        kernel_scan.setArg(2, cl::Local(local_size * sizeof(float)));
+        kernel_scan.setArg(3, global_size);
+        opencl.queue.flush();
 
-    kernel_fin.setArg(0, d_a);
-    kernel_fin.setArg(1, 1024);
-    opencl.queue.enqueueNDRangeKernel(kernel_fin, cl::NullRange, cl::NDRange(n/1024 - 1), cl::NullRange);
+        opencl.queue.enqueueNDRangeKernel(kernel_scan, cl::NullRange, cl::NDRange(next_global_size * local_size), cl::NDRange(local_size));
+        opencl.queue.flush();
 
-    kernel_fin.setArg(0, d_a);
-    kernel_fin.setArg(1, 1024*1024);
-    opencl.queue.enqueueNDRangeKernel(kernel_fin, cl::NullRange, cl::NDRange(n/(1024 * 1024) - 1), cl::NullRange);
+        i++;
+        global_size = next_global_size;
+    }
+    for (int j = i - 1; j >= 1; j--)
+    {
+        kernel_complete.setArg(0, tiles[j - 1]);
+        kernel_complete.setArg(1, tiles[j]);
+        kernel_complete.setArg(2, sizes[j - 1]);
+        opencl.queue.flush();
 
-    opencl.queue.finish();
-
+        opencl.queue.enqueueNDRangeKernel(kernel_complete, cl::NullRange, cl::NDRange(((sizes[j - 1] + local_size - 1) / local_size) * local_size), cl::NDRange(local_size));
+        opencl.queue.flush();
+    }
     auto t3 = clock_type::now();
-    cl::copy(opencl.queue, d_a, begin(result), end(result));
-
+    opencl.queue.enqueueReadBuffer(tiles[0], true, 0, result.size()*sizeof(float), begin(result));
+    opencl.queue.flush();
     auto t4 = clock_type::now();
+    verify_vector(expected_result, result, (float)(1e4));
     print("scan-inclusive",
-          {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3},
-          {bandwidth(n*n+n*n+n*n, t0, t1), bandwidth(n*n+n*n+n*n, t2, t3)});
-
-
-    //verify_vector(expected_result, result);
-
-    // for (int k = 1; k < n; k += 1) {
-    //   std::cout << k << ' ' << result[k] << ' ' << expected_result[k] << ' ' << std::abs(result[k] - expected_result[k]) << '\n';
-    // }
+          {t1 - t0, t4 - t1, t2 - t1, t3 - t2, t4 - t3},
+          {bandwidth(n * n + n * n + n * n, t0, t1), bandwidth(n * n + n * n + n * n, t2, t3)});
     std::cout << result[1024*1024*10 - 1] << ' ' << expected_result[1024*1024*10 - 1] << ' ' << std::abs(result[1024*1024*10 - 1] - expected_result[1024*1024*10 -1]) << '\n';
 }
 
@@ -210,33 +212,52 @@ kernel void reduce(global float* a,
 }
 
 kernel void scan_inclusive(global float* a,
-                           global float* result,
-                           int a_step) {
-    const int i = get_global_id(0);
-    const int local_i = get_local_id(0);
-    const int local_size = get_local_size(0);
-    local float group_part[1024];
-    group_part[local_i] = a[(a_step-1) + i*a_step];
+                            global float* result,
+                            local float* tileResult,
+                            int n) {
+    int local_id = get_local_id(0); // номер потока в группе
+    int global_id = get_global_id(0);
+    int group_id = get_group_id(0);
+    int local_size = get_local_size(0);
+
+    if (global_id >= n) {
+        tileResult[local_id] = .0;
+    } else {
+        tileResult[local_id] = a[global_id];
+    }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    float sum = group_part[local_i];
-    for (int offset=1; offset<local_size; offset *= 2) {
-      if (local_i >= offset) {
-        sum += group_part[local_i - offset];
-      }
-      barrier(CLK_LOCAL_MEM_FENCE);
-      group_part[local_i] = sum;
-      barrier(CLK_LOCAL_MEM_FENCE);
+    for(int offset = 1; offset < local_size; offset *= 2) {
+        float sum = 0;
+        if(local_id >= offset && global_id < n) {
+            sum += tileResult[local_id - offset];
+            tileResult[local_id] += sum;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
-    a[(a_step-1) + i*a_step] = group_part[local_i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    if (global_id < n){
+        a[global_id] = tileResult[local_id];
+    }
+
+    if (local_id == 0) {        
+       	result[group_id] = tileResult[local_size-1];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
 }
 
-kernel void finish_scan_inclusive(global float*a, int step) {
-        const int i = get_global_id(0);
-        for (int p = 0; p < step-1; p++) {
-          a[(i+1)*step + p] += a[(i+1)*step - 1];
-        }
+kernel void scan_complete(global float* a, 
+                            global float* tileResult,
+                            int n) {
+    int global_id = get_global_id(0);
+    int group_id = get_group_id(0);
+    int local_size = get_local_size(0);
+
+    if (global_id >= local_size && global_id < n){
+        a[global_id] += tileResult[group_id-1];
     }
+}
 )";
 
 int main() {
