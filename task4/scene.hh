@@ -110,6 +110,7 @@ public:
         return ray(_origin, _lower_left_corner + u*_horizontal + v*_vertical - _origin);
     }
     inline void move(vec delta) noexcept { this->_origin += delta; }
+    const vec& origin() const { return _origin; }
 };
 
 #endif // vim:filetype=cpp
